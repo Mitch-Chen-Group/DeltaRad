@@ -1,0 +1,1435 @@
+
+---
+title: "Delta Model Analysis"
+output: github_document
+---
+
+
+
+```{r}
+library(irr)
+library(caTools)
+library(FactoMineR)
+library(factoextra)
+library(gtsummary)
+library(glmnet)
+library(Boruta)
+library(praznik)
+library(bimba)
+library(caret)
+library(randomForest)
+library(kernlab)
+library(naivebayes)
+library(nnet)
+library(pls)
+library(e1071)
+library(doParallel)
+library(pROC)
+library(survival)
+library(survminer)
+library(maxstat)
+library(fastshap)
+library(shapviz)
+library(ggplot2)
+library(reshape2)
+library(knitr)
+library(magrittr)
+library(tibble)
+library(tidyr)
+library(stringr)
+library(purrr)
+library(glue)
+library(dplyr)
+
+'%ni%' <- Negate('%in%')
+```
+
+
+
+```{r}
+# Load RIDER and your Delta dataset 
+rider <- read.csv("FINAL_RIDER_FEATURES_COMBINED.csv")
+
+x_delta <- read.csv("PDL1_DELTA_ABS_CONCATENATED.csv")
+
+#ensure names match up between features (get rid abs name from feature name bit here)
+names(x_delta) <- trimws(names(x_delta))
+names(rider) <- trimws(names(rider))
+names(x_delta) <- gsub("_abs_", "_", names(x_delta))
+
+# Identify features common to both RIDER and the main dataset 
+feats <- intersect(
+  setdiff(names(rider), c("Patient_Num", "Timepoint", "His")),
+  setdiff(names(x_delta), c("Patient_Num", "His"))
+)
+
+#Split RIDER into pre/post scans
+pre  <- rider[rider$Timepoint == "pre",  ]
+post <- rider[rider$Timepoint == "post", ]
+
+#Calculate ICC
+icc_vals <- sapply(feats, function(f) {
+  m <- merge(pre[c("Patient_Num", f)], post[c("Patient_Num", f)], by = "Patient_Num")
+  # Return NA if no common patients are found
+  if(nrow(m) < 2) return(NA)
+  icc(m[, 2:3], model = "twoway", type = "agreement")$value
+})
+
+# 5. Keep only reproducible features 
+reproducible_feats <- names(icc_vals[!is.na(icc_vals) & icc_vals >= 0.8])
+
+message(glue("Retained {length(reproducible_feats)} features out of {length(feats)} tested."))
+
+# 6. Update dataset x_delta, include outcome (his) and patient id
+cols_to_keep <- c("Patient_Num", "His", reproducible_feats)
+# Check which columns actually exist 
+valid_cols <- cols_to_keep[cols_to_keep %in% names(x_delta)]
+x_delta <- x_delta[, valid_cols]
+
+message(glue("Dataset 'x_delta' has been updated. New column count: {ncol(x_delta)}"))
+saveRDS(reproducible_feats, "reproducible_feats.rds")
+write.csv(x_delta, "x_icc_filtered_absolute.csv", row.names = FALSE)
+```
+
+
+```{r}
+### SPLIT DATA INTO TRAINING AND EXTERNAL VALIDATION 
+set.seed(43)
+split_idx = sample.split(x_delta$His, SplitRatio = 0.8)
+train_set_full <- subset(x_delta, split_idx == T)
+val_set_full <- subset(x_delta, split_idx == F)
+train_set_full <- as.data.frame(train_set_full)
+val_set_full <- as.data.frame(val_set_full)
+     
+```
+
+```{r}
+r_train_mean <- colMeans(train_set_full[, 3:ncol(train_set_full)], na.rm = TRUE)
+r_train_std  <- sapply(train_set_full[, 3:ncol(train_set_full)], sd, na.rm = TRUE)
+
+r_scaled_train <- as.data.frame(scale(train_set_full[, 3:ncol(train_set_full)],
+                                       center = r_train_mean, scale = r_train_std))
+
+r_scaled_val <- as.data.frame(scale(val_set_full[, 3:ncol(val_set_full)],
+                                     center = r_train_mean, scale = r_train_std))
+```
+
+```{r}
+x_pca_input <- as.matrix(r_scaled_train) # unsupervised methods, Here we are selecting just the input variables, not the outcome variable, as PCA is an unsupervised technique
+```
+
+```{r}
+x_pca_input <- x_pca_input[ , which(apply(x_pca_input, 2, var) != 0)]
+r_scaled_train <- r_scaled_train[ , which(apply(r_scaled_train, 2, var) != 0)]
+```
+
+```{r}
+# Here we undertake principal component analysis for dimensionality reduction
+prin_comp <- prcomp(x_pca_input, scale. = F)  
+```
+
+```{r}
+# calculate the std deviation of the PCs and then compute the variance
+std_dev <- prin_comp$sdev
+pr_var <- std_dev^2
+# compute the proportion of the variance explained by each PC
+prop_varex <- pr_var/sum(pr_var)
+# create a scree plot to look at how many PCs to select - "zoom" in to the first x number of PCs rather than looking at all
+zoom <- prop_varex[1:50]
+plot(zoom, xlab = "Principal Component",
+             ylab = "Proportion of Variance Explained",
+             type = "b")
+# A cumulative scree plot also helps to visualize - this shows that the first ~X PCs explain approx 90% of the variance
+plot(cumsum(zoom), xlab = "Principal Component",
+              ylab = "Cumulative Proportion of Variance Explained",
+              type = "b")
+res.pca <- PCA(x_pca_input, graph = T, scale.unit = T, ncp = 5)
+eig.val <- get_eigenvalue(res.pca)
+
+fviz_eig(res.pca, addlabels = T, ylim = c(0,50))
+
+vari <- get_pca_var(res.pca)
+
+# Contributions of variables to PC1&2
+fviz_contrib(res.pca, choice = "var", axes = 1:2, top = 100)
+cumsum(prop_varex)[1:15]  # shows cumulative variance for first 15 PCs
+train.pca<- as.data.frame(prin_comp$x)
+train.pca<- train.pca[,1:8] # here account for 80% variance
+train.pca$His <- train_set_full$His
+
+val.pca <- as.data.frame(predict(prin_comp, newdata = r_scaled_val))
+val.pca <- val.pca[,1:8] # same here account to 80% variance
+val.pca$His <- val_set_full$His
+```
+
+```{r}
+
+### NOW FOR THE SUPERVISED APPROACHES - FOR THIS WE FIRST REMOVE HIGHLY CORRELATED FEATURES AND APPLY THE FDR STEP
+
+### Now to look at just the radiomic features and remove any that are highly correlated
+cor_mat <- cor(r_scaled_train)
+cor_mat[upper.tri(cor_mat)] <- 0
+diag(cor_mat) <- 0
+# # Above two commands can be replaced with
+#  cor_mat[!lower.tri(cor_mat)] <- 0
+# #
+filt_rad_train <- as.data.frame(as.matrix(r_scaled_train)[,!apply(cor_mat,2,function(z) any(z > 0.90))])
+```
+
+```{r}
+head(filt_rad_train)
+ncol(filt_rad_train)
+filt_rad_train$His <- as.factor(train_set_full$His)
+
+### Now we undertake the FDR step by taking the univariate LR for each variable in the training set. We extract the list of p-values and apply BH correction to account for multiple testing. Then we create a list of significant values (number of values differs according to how strict a p value threshold is used). This can take several minutes.
+uni_reg = tbl_uvregression(
+  data = filt_rad_train,
+  method = glm,
+  method.args = list(family = binomial),
+  y = His
+)
+
+# 1. Extract the variable names and p-values from the regression results
+res_sig <- uni_reg[["table_body"]][, c("variable", "p.value")]
+
+# 2. Apply the Benjamini-Hochberg (BH) correction to the p-values
+
+res_sig$p_adjusted <- p.adjust(res_sig$p.value, method = "BH", n = length(res_sig$p.value))
+
+# 3. Filter for significant features (p < 0.05)
+# NOTE: this filters on the RAW p-value. To apply the BH correction properly,
+# switch to: final <- subset(res_sig, p_adjusted < 0.05)
+final <- subset(res_sig, p.value < 0.05)
+uni_LR_variables <- final$variable
+
+length(uni_LR_variables)
+uni_LR_variables
+```
+
+```{r}
+# Now we subset the training and validation sets to use the significant variables
+names(r_scaled_val) <- make.names(names(r_scaled_val))
+
+filt_rad_val <- as.data.frame(r_scaled_val[, uni_LR_variables])
+```
+
+```{r}
+filt_rad_train <- filt_rad_train[, uni_LR_variables]
+filt_rad_val <- as.data.frame(r_scaled_val[, uni_LR_variables])
+
+filt_rad_train$His <- train_set_full$His
+filt_rad_val$His <- val_set_full$His
+# Convert the predictor features into a numeric matrix (x_train) and binarize the target outcomes into 1 (Responder) and 0 (Non-Responder) (y),
+
+x_train <- as.matrix(filt_rad_train[, 1:(ncol(filt_rad_train)-1)]) 
+y <- ifelse(filt_rad_train$His == "R", 1,
+     ifelse(filt_rad_train$His == "NR", 0, NA))
+y_val <- ifelse(val_set_full$His == "R", 1,
+     ifelse(val_set_full$His == "NR", 0, NA))
+x_train
+```
+
+```{r}
+### Now we will perform a LASSO (10-fold cross validation on the training data)
+set.seed(123)
+fit_lasso <- glmnet(x_train, y, family="binomial", alpha=1, standardize=TRUE)
+plot(fit_lasso, label=TRUE)
+cv_lasso <- cv.glmnet(x_train, y, family="binomial", alpha=1, standardize=TRUE)
+fit_lasso <- glmnet(x_train, y, family="binomial", alpha=1, lambda=cv_lasso$lambda.min, standardize=TRUE)
+plot(cv_lasso)
+pred_lasso <- predict(fit_lasso, x_train)
+
+coefs <- coef(fit_lasso, s='lambda.min') ### can change this to lambda.1se
+inds <- which(coefs!=0)
+sel_vars <- row.names(coefs)[inds]
+Lasso.vars <- sel_vars[sel_vars %ni% '(Intercept)']
+print(length(Lasso.vars))
+Lasso.vars
+```
+
+```{r}
+# Now we perform ELASTIC-NET (10-fold cross validation on the training data)
+set.seed(123)
+fit_enet <- glmnet(x_train, y, family="binomial", alpha=0.5, standardize=TRUE)
+plot(fit_enet, label=TRUE)
+cv_enet <- cv.glmnet(x_train, y, family="binomial", alpha=0.5, standardize=TRUE)
+fit_enet <- glmnet(x_train, y, family="binomial", alpha=0.5, lambda=cv_enet$lambda.min, standardize=TRUE)
+plot(cv_enet)
+pred_enet <- predict(fit_enet, x_train)
+coefs <- coef(fit_enet, s='lambda.min') ### can change this to lambda.1se
+inds <- which(coefs!=0)
+sel_vars <- row.names(coefs)[inds]
+E.Net.vars <- sel_vars[sel_vars %ni% '(Intercept)']
+print(length(E.Net.vars))
+E.Net.vars
+```
+
+```{r}
+### Recursive Feature Elimination
+x_train <- as.data.frame(x_train)
+y <- as.factor(y)
+
+set.seed(321)
+control <- rfeControl(functions = rfFuncs,
+                      method = "repeatedcv",
+                      repeats = 5,
+                      number = 10)
+
+result_rfe1 <- rfe(x_train, y, sizes = c(1:116), rfeControl = control)
+
+result_rfe1
+predictors(result_rfe1)
+rfe.vars <- predictors(result_rfe1)
+
+ggplot(data = result_rfe1, metric = "Accuracy") + theme_bw()
+ggplot(data = result_rfe1, metric = "Kappa") + theme_bw()
+
+varimp_data <- data.frame(feature = row.names(varImp(result_rfe1))[1:20],
+                          importance = varImp(result_rfe1)[1:20, 1])
+
+rfe_importance <- ggplot(data = varimp_data,
+       aes(x = reorder(feature, importance), y = importance, fill = feature)) +
+  geom_bar(stat="identity") + labs(x = "Features", y = "Variable Importance", title="Recursive Feature Elimination Results") +
+  geom_text(aes(label = round(importance, 2)), hjust = 1.2, color="black", size=3) +
+  theme_bw() + theme(legend.position = "none")
+
+rfe_importance + coord_flip()
+```
+
+```{r}
+# Boruta
+set.seed(123)
+y <- as.factor(y)
+boruta.train <- Boruta(x_train, y, doTrace = 2, num.threads = 8)
+
+final.boruta <- TentativeRoughFix(boruta.train)
+print(final.boruta)
+bor.vars <- getSelectedAttributes(final.boruta, withTentative = F)
+```
+
+```{r}
+# Mutual Information
+set.seed(123)
+MIM.train <- MIM(x_train, y, k=10)
+mim.vars <- MIM.train$selection
+mim.vars
+```
+
+```{r}
+# Pearson
+outcome <- as.numeric(y)
+pearson_var <- cor(x_train, outcome, method = "pearson")
+pearson_var <- as.data.frame(abs(pearson_var))
+pearson_var <- top_frac(pearson_var, 0.2)
+p.vars <- row.names(pearson_var)
+print(length(p.vars))
+p.vars
+```
+
+```{r}
+# Spearman
+spearman_var <- cor(x_train, outcome, method = "spearman")
+spearman_var <- as.data.frame(abs(spearman_var))
+spearman_var <- top_frac(spearman_var, 0.2)
+s.vars <- row.names(spearman_var)
+print(length(s.vars))
+s.vars
+```
+
+```{r}
+# Kendall
+kendall_var <- cor(x_train, outcome, method = "kendall")
+kendall_var <- as.data.frame(abs(kendall_var))
+kendall_var <- top_frac(kendall_var, 0.2)
+k.vars <- row.names(kendall_var)
+print(length(k.vars))
+k.vars
+```
+
+```{r}
+pca = 'pca'
+features_select <- list(p.vars, s.vars, k.vars, rownames(as.data.frame(mim.vars)), Lasso.vars, E.Net.vars, bor.vars, rfe.vars, pca)
+
+# defined here so it exists before the training loop below uses it
+fs_names <- c("p.vars", "s.vars", "k.vars", "mim.vars", "Lasso.vars",
+              "E.Net.vars", "bor.vars", "rfe.vars", "pca")
+```
+
+
+```{r}
+models_list <- list()
+# pull all metrics together
+get_metrics <- function(cm, prob, truth) {
+  auc_val <- as.numeric(pROC::auc(pROC::roc(response = truth, predictor = prob,
+                                             levels = c("Neg","Pos"), direction = "<", quiet = TRUE)))
+  c(Sens = unname(cm$byClass["Sensitivity"]),
+    Spec = unname(cm$byClass["Specificity"]),
+    PPV  = unname(cm$byClass["Pos Pred Value"]),
+    NPV  = unname(cm$byClass["Neg Pred Value"]),
+    F1   = unname(cm$byClass["F1"]),
+    AUC  = auc_val)
+}
+
+
+res_list <- list()
+
+for (i in features_select){
+    
+    if (identical(i, "pca")){ 
+        rad_train3 <- train.pca
+        rad_train3$His <- ifelse(train_set_full$His == "R", 1,
+                           ifelse(train_set_full$His == "NR", 0, NA))
+        
+        rad_val3 <- val.pca
+        rad_val3$His <- ifelse(val_set_full$His == "R", 1,
+                         ifelse(val_set_full$His == "NR", 0, NA))
+    } else {
+        # Subset features securely
+        temp_features <- filt_rad_train[ , i, drop = FALSE]
+        rad_train3 <- cbind(temp_features, His = y)
+        
+        temp_val_features <- filt_rad_val[ , i, drop = FALSE]
+        rad_val3 <- cbind(temp_val_features, His = val_set_full$His)
+    }
+    
+    # 1. Validation Step 
+    if (length(i) == 0 || ncol(rad_train3) < 2) {
+        message("Skipping completely empty feature set.")
+        next 
+    }
+    
+    # Count features 
+    n_features <- ncol(rad_train3) - 1
+
+    synth_train <- ADASYN(rad_train3, perc_min = 50, k=5)
+    rad_train3 <- synth_train
+    
+    rad_train3$His <- factor(rad_train3$His, levels = c(0, 1), labels = c("Neg", "Pos"))
+    rad_val3$His   <- factor(y_val, levels = c(0, 1), labels = c("Neg", "Pos"))
+    
+    ### 1) GLM
+    trctrl <- trainControl(method = "repeatedcv", number = 10, repeats = 3, classProbs = TRUE)
+    set.seed(42)
+    classifier_glm <- train(form = His ~ ., data = rad_train3, method = "glm",
+                            family=binomial, trControl = trctrl, tuneLength = 20)
+    glm_pred = factor(predict(classifier_glm, newdata = rad_val3[-ncol(rad_val3)]), levels = c("Neg","Pos"))
+    cm_glm = confusionMatrix(glm_pred, reference = as.factor(rad_val3$His), positive = "Pos")
+    glm_prob = predict(classifier_glm, newdata = rad_val3[-ncol(rad_val3)], type = "prob")[, "Pos"]
+    metrics_glm = get_metrics(cm_glm, glm_prob, rad_val3$His)
+    
+    ### 2) KNN
+    set.seed(42)
+    classifier_knn2 = train(form = His ~ ., data = rad_train3, method = "knn",
+                            trControl=trctrl, tuneLength = 20)
+    knn2_pred = factor(predict(classifier_knn2, newdata = rad_val3[-ncol(rad_val3)]), levels = c("Neg","Pos"))
+    cm_knn2 = confusionMatrix(knn2_pred, reference = as.factor(rad_val3$His), positive = "Pos")
+    knn2_prob = predict(classifier_knn2, newdata = rad_val3[-ncol(rad_val3)], type = "prob")[, "Pos"]
+    metrics_knn2 = get_metrics(cm_knn2, knn2_prob, rad_val3$His)
+    
+    ### 3) LINEAR SUPPORT VECTOR MACHINE
+    set.seed(42)
+    classifier_svm2 = train(form = His ~ ., data = rad_train3, method = "svmLinear",
+                            trControl=trctrl, tuneLength = 20)
+    svm_pred = factor(predict(classifier_svm2, newdata = rad_val3), levels = c("Neg","Pos"))
+    cm_svm2 = confusionMatrix(svm_pred, reference = as.factor(rad_val3$His), positive = "Pos")
+    svm_prob = predict(classifier_svm2, newdata = rad_val3, type = "prob")[, "Pos"]
+    metrics_svm2 = get_metrics(cm_svm2, svm_prob, rad_val3$His)
+    
+    ### 4) NAIVE BAYES CLASSIFIER
+    set.seed(42)
+    classifier_nb = train(form = His ~ ., data = rad_train3, method = "naive_bayes",
+                          trControl=trctrl, tuneLength = 20)
+    nb_pred = factor(predict(classifier_nb, newdata = rad_val3), levels = c("Neg","Pos"))
+    cm_nb = confusionMatrix(nb_pred, reference = as.factor(rad_val3$His), positive = "Pos")
+    nb_prob = predict(classifier_nb, newdata = rad_val3, type = "prob")[, "Pos"]
+    metrics_nb = get_metrics(cm_nb, nb_prob, rad_val3$His)
+    
+    ### 5) Random Forest  
+    set.seed(42)
+    if (n_features == 1) {
+        tunegrid <- expand.grid(mtry = 1)
+    } else {
+        mtry_val <- max(1, floor(sqrt(n_features)))
+        tunegrid <- expand.grid(mtry = unique(pmin(c(2, 3, mtry_val), n_features)))
+    }
+    classifier_rf = train(form = His ~ ., data = rad_train3, method = "rf",
+                          trControl=trctrl, tuneGrid = tunegrid)
+    rf_pred = factor(predict(classifier_rf, newdata = rad_val3[-ncol(rad_val3)]), levels = c("Neg","Pos"))
+    cm_rf = confusionMatrix(rf_pred, reference = rad_val3$His, positive = "Pos") 
+    rf_prob = predict(classifier_rf, newdata = rad_val3[-ncol(rad_val3)], type = "prob")[, "Pos"]
+    metrics_rf = get_metrics(cm_rf, rf_prob, rad_val3$His)
+    
+    ### 6) ARTIFICIAL NEURAL NETWORK
+    set.seed(42)
+    trctrl_nnet <- trainControl(method = "repeatedcv", number = 1, repeats = 1, verboseIter = FALSE, classProbs = TRUE)
+    classifier_nnet = train(form = His ~ ., data = rad_train3, method = "nnet", trace=FALSE,
+                            trainControl = trctrl_nnet, tuneLength = 20, verboseIter=FALSE)
+    nn_pred = factor(predict(classifier_nnet, newdata = rad_val3[-ncol(rad_val3)]), levels = c("Neg","Pos"))
+    cm_nnet = confusionMatrix(nn_pred, as.factor(rad_val3$His), positive = "Pos")
+    nn_prob = predict(classifier_nnet, newdata = rad_val3[-ncol(rad_val3)], type = "prob")[, "Pos"]
+    metrics_nnet = get_metrics(cm_nnet, nn_prob, rad_val3$His)
+    
+    ### 8) PARTIAL LEAST SQUARES 
+    set.seed(42)
+    if (n_features == 1) {
+        classifier_pls = train(form = His ~ ., data = rad_train3, method = "pls",
+                               trainControl = trctrl, tuneGrid = expand.grid(ncomp = 1))
+    } else {
+        classifier_pls = train(form = His ~ ., data = rad_train3, method = "pls",
+                               trainControl = trctrl, tuneLength = min(20, n_features))
+    }
+    pls_pred = factor(predict(classifier_pls, newdata = rad_val3[-ncol(rad_val3)]), levels = c("Neg","Pos"))
+    cm_pls = confusionMatrix(pls_pred, reference = as.factor(rad_val3$His), positive = "Pos")
+    pls_prob = predict(classifier_pls, newdata = rad_val3[-ncol(rad_val3)], type = "prob")[, "Pos"]
+    metrics_pls = get_metrics(cm_pls, pls_prob, rad_val3$His)
+        
+   ### 9) Ridge Regression
+    if (n_features > 1) {
+        lambda <- 10^seq(-3, 3, length = 100)
+        set.seed(123)
+        classifier_ridge <- train(His ~., data = rad_train3, method = "glmnet", family = "binomial",
+                                  trControl = trctrl, tuneGrid = expand.grid(alpha = 0, lambda = lambda))
+        ridge_pred = factor(predict(classifier_ridge, newdata = rad_val3[-ncol(rad_val3)]), levels = c("Neg","Pos"))
+        cm_ridge = confusionMatrix(ridge_pred, reference = as.factor(rad_val3$His), positive = "Pos")
+        ridge_prob = predict(classifier_ridge, newdata = rad_val3[-ncol(rad_val3)], type = "prob")[, "Pos"]
+        metrics_ridge = get_metrics(cm_ridge, ridge_prob, rad_val3$His)
+    } else {
+        metrics_ridge <- c(Sens = NA, Spec = NA, PPV = NA, NPV = NA, F1 = NA, AUC = NA)
+    }
+    
+    ### 10) LASSO Regression
+    if (n_features > 1) {
+        lambda <- 10^seq(-3, 3, length = 100)
+        set.seed(123)
+        classifier_lasso <- train(His ~., data = rad_train3, method = "glmnet", family = "binomial",
+                                  trControl = trctrl, tuneGrid = expand.grid(alpha = 1, lambda = lambda))
+        lasso_pred = factor(predict(classifier_lasso, newdata = rad_val3[-ncol(rad_val3)]), levels = c("Neg","Pos"))
+        cm_lasso = confusionMatrix(lasso_pred, reference = as.factor(rad_val3$His), positive = "Pos") 
+        lasso_prob = predict(classifier_lasso, newdata = rad_val3[-ncol(rad_val3)], type = "prob")[, "Pos"]
+        metrics_lasso = get_metrics(cm_lasso, lasso_prob, rad_val3$His)
+    } else {
+        metrics_lasso <- c(Sens = NA, Spec = NA, PPV = NA, NPV = NA, F1 = NA, AUC = NA)
+    }
+    
+    ### 11) Elastic Net Regression
+    if (n_features > 1) {
+        lambda <- 10^seq(-3, 3, length = 100)
+        set.seed(123)
+        classifier_elastic <- train(His ~., data = rad_train3, method = "glmnet",
+                                    trControl = trctrl, tuneGrid = expand.grid(alpha = 0.5, lambda = lambda))
+        elastic_pred = factor(predict(classifier_elastic, newdata = rad_val3[-ncol(rad_val3)]), levels = c("Neg","Pos"))
+        cm_elastic = confusionMatrix(elastic_pred, reference = as.factor(rad_val3$His), positive = "Pos")
+        elastic_prob = predict(classifier_elastic, newdata = rad_val3[-ncol(rad_val3)], type = "prob")[, "Pos"]
+        metrics_elastic = get_metrics(cm_elastic, elastic_prob, rad_val3$His)
+    } else {
+        metrics_elastic <- c(Sens = NA, Spec = NA, PPV = NA, NPV = NA, F1 = NA, AUC = NA)
+    }
+    
+    tmp_metrics <- rbind(
+      ElasticNet   = metrics_elastic,
+      GLM          = metrics_glm,
+      Lasso        = metrics_lasso,
+      Ridge        = metrics_ridge,
+      NaiveBayes   = metrics_nb,
+      KNN          = metrics_knn2,
+      NNET         = metrics_nnet,
+      RandomForest = metrics_rf,
+      SVM          = metrics_svm2,
+      PLS          = metrics_pls
+    )
+    
+    # Store results in the list
+    res_list[[length(res_list) + 1]] <- tmp_metrics
+    
+    models_list[[length(models_list) + 1]] <- list(
+      GLM          = classifier_glm,
+      KNN          = classifier_knn2,
+      SVM          = classifier_svm2,
+      NaiveBayes   = classifier_nb,
+      RandomForest = classifier_rf,
+      NNET         = classifier_nnet,
+      PLS          = classifier_pls,
+      Ridge        = if (n_features > 1) classifier_ridge else NULL,
+      Lasso        = if (n_features > 1) classifier_lasso else NULL,
+      ElasticNet   = if (n_features > 1) classifier_elastic else NULL
+    )
+}
+names(models_list) <- fs_names  
+
+saveRDS(models_list, "all_trained_models.rds")
+
+# save the model perfromances to apply to external validation later 
+saveRDS(features_select, "features_select.rds")
+saveRDS(r_train_mean, "r_train_mean.rds")
+saveRDS(r_train_std,  "r_train_std.rds")
+saveRDS(uni_LR_variables, "uni_LR_variables.rds")
+saveRDS(prin_comp, "prin_comp.rds")   # needed for the pca arm
+saveRDS(reproducible_feats, "reproducible_feats.rds")
+
+
+names(res_list) <- fs_names
+
+
+```
+
+
+
+
+```{r}
+
+# Reshape the list  into a single dataframe
+internal_metrics_df <- imap_dfr(res_list, ~ {
+  as.data.frame(.x) %>%
+    rownames_to_column(var = "Model") %>%
+    mutate(FeatureSet = .y)
+}) %>%
+  select(FeatureSet, Model, Sens, Spec, PPV, NPV, F1, AUC) %>%
+  mutate_if(is.numeric, round, 3)
+
+# Create the Internal Validation AUC Heatmap
+internal_auc_plot <- ggplot(internal_metrics_df, aes(x = FeatureSet, y = Model, fill = AUC)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(AUC, 2)), size = 3) +
+  scale_fill_gradient2(low = "firebrick", mid = "white", high = "steelblue",
+                       midpoint = 0.5, limits = c(0, 1), na.value = "grey90") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "RPV Delta Absolute - Internal Validation AUC",
+       subtitle = "Performance on the 20% internal hold-out set",
+       x = "Feature Selection Method", y = "ML Model")
+
+#  save the plot
+print(internal_auc_plot)
+
+ggsave("Internal_Validation_AUC_Heatmap.png", plot = internal_auc_plot, 
+       width = 10, height = 7, dpi = 300)
+
+
+```
+
+
+```{r}
+
+# load saaved trained internal models
+models_list       <- readRDS("all_trained_models.rds")
+features_select   <- readRDS("features_select.rds")
+r_train_mean      <- readRDS("r_train_mean.rds")
+r_train_std       <- readRDS("r_train_std.rds")
+uni_LR_variables  <- readRDS("uni_LR_variables.rds")
+prin_comp         <- readRDS("prin_comp.rds")
+
+fs_names <- c("p.vars","s.vars","k.vars","mim.vars","Lasso.vars",
+              "E.Net.vars","bor.vars","rfe.vars","pca")
+
+# Load external cohort 
+ext <- read.csv("FINAL_DELTA_ABS_CONCATENATED.csv")
+names(ext) <- trimws(names(ext))
+names(ext) <- gsub("_(abs)_", "_", names(ext))
+
+# reproducible_feats + outcome column must already match training set columns
+ext <- ext[, c("Patient_Num", "His", intersect(reproducible_feats, names(ext)))]
+
+# scale() matches by position, not by name - fail loudly if the columns have
+# drifted rather than silently applying the wrong means
+stopifnot(identical(names(ext)[-(1:2)], names(r_train_mean)))
+
+# Scale using internal train mean/sd 
+ext_scaled <- as.data.frame(scale(ext[, 3:ncol(ext)],
+                                   center = r_train_mean, scale = r_train_std))
+names(ext_scaled) <- make.names(names(ext_scaled))
+
+# Restrict to univariate-significant vars (same step as filt_rad_val) 
+ext_uniLR <- as.data.frame(ext_scaled[, uni_LR_variables, drop = FALSE])
+
+ext_His <- factor(ifelse(ext$His == "R", 1,
+                  ifelse(ext$His == "NR", 0, NA)),
+                  levels = c(0,1), labels = c("Neg","Pos"))
+
+#Store AUC results 
+auc_matrix <- matrix(NA, nrow = length(fs_names), ncol = 10,
+                      dimnames = list(fs_names,
+                                      c("GLM","KNN","SVM","NaiveBayes","RandomForest",
+                                        "NNET","PLS","Ridge","Lasso","ElasticNet")))
+
+for (fs in fs_names) {
+
+  if (fs == "pca") {
+    ext_input <- as.data.frame(predict(prin_comp, newdata = ext_scaled))
+    ext_input <- ext_input[, 1:8]   # same number of PCs kept as training
+  } else {
+    vars <- features_select[[which(fs_names == fs)]]
+    vars <- intersect(vars, names(ext_uniLR))  # guard against any column mismatch
+    ext_input <- ext_uniLR[, vars, drop = FALSE]
+  }
+
+  mods <- models_list[[fs]]
+
+  for (mod_name in names(mods)) {
+    mdl <- mods[[mod_name]]
+    if (is.null(mdl)) next   
+
+    prob <- tryCatch(
+      predict(mdl, newdata = ext_input, type = "prob")[, "Pos"],
+      error = function(e) NA
+    )
+
+    if (all(is.na(prob))) next
+
+    roc_obj <- tryCatch(
+      pROC::roc(response = ext_His, predictor = prob,
+                levels = c("Neg","Pos"), direction = "<", quiet = TRUE),
+      error = function(e) NULL
+    )
+
+    if (!is.null(roc_obj)) {
+      auc_matrix[fs, mod_name] <- as.numeric(pROC::auc(roc_obj))
+    }
+  }
+}
+
+auc_matrix
+write.csv(auc_matrix, "external_AUC_all_combos.csv")
+```
+
+```{r}
+
+
+# matrix to for ggplot
+auc_df <- melt(auc_matrix, varnames = c("FeatureSet", "Model"), value.name = "AUC")
+
+# Plot heatmap
+ggplot(auc_df, aes(x = FeatureSet, y = Model, fill = AUC)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(AUC, 2)), size = 3) +
+  scale_fill_gradient2(low = "firebrick", mid = "white", high = "steelblue",
+                        midpoint = 0.5, limits = c(0, 1), na.value = "grey90") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "RPV External Validation AUC — Absolute",
+       x = "Feature Selection Method", y = "ML Model")
+```
+
+```{r}
+
+# load external survival data
+
+crf_surv <- read.csv("CRF-LCIO-UPDATES.csv")
+
+crf_surv$Patient_Num <- as.numeric(gsub("\\D", "", crf_surv$Study.ID))
+
+surv_data <- crf_surv[, c("Patient_Num", "OS.event", "Overall.survival..days.")]
+names(surv_data) <- c("Patient_Num", "OS_event", "OS_time")
+
+n_before  <- nrow(surv_data)
+surv_data <- surv_data[!is.na(surv_data$OS_event) & !is.na(surv_data$OS_time), ]
+
+
+print(table(surv_data$OS_event))
+```
+
+```{r}
+ext_surv <- merge(ext, surv_data, by = "Patient_Num")
+
+lost <- setdiff(ext$Patient_Num, ext_surv$Patient_Num)
+if (length(lost) > 0) {
+  message("\nPatients dropped for missing survival data:",
+      length(lost), "->", paste(lost, collapse = ", "), "\n")
+}
+```
+
+```{r}
+chosen_fs       <- "k.vars"
+chosen_mod      <- "NNET"
+modality_label  <- "Absolute"
+
+vars <- features_select[[which(fs_names == chosen_fs)]]
+vars <- intersect(vars, names(ext_uniLR))
+stopifnot(length(vars) > 0)
+
+# Match by Patient_Num
+idx <- match(ext_surv$Patient_Num, ext$Patient_Num)
+stopifnot(!any(is.na(idx)), length(idx) == nrow(ext_surv))
+
+ext_input_chosen <- ext_uniLR[idx, vars, drop = FALSE]
+
+chosen_model <- models_list[[chosen_fs]][[chosen_mod]]
+ext_surv$Predicted_Prob <- predict(chosen_model, newdata = ext_input_chosen, type = "prob")[, "Pos"]
+
+message("Model:", chosen_fs, "x", chosen_mod, "(", modality_label, ")\n")
+message("Features used:", length(vars), "\n")
+```
+
+```{r}
+maxstat_res <- maxstat.test(
+  Surv(OS_time, OS_event) ~ Predicted_Prob,
+  data    = ext_surv,
+  smethod = "LogRank",
+  pmethod = "exactGauss"
+)
+
+print(maxstat_res)
+
+cutpoint <- as.numeric(maxstat_res$estimate)
+message("\nOptimal cutpoint:", signif(cutpoint, 4), "\n")
+message("Corrected p-value:", signif(maxstat_res$p.value, 4), "\n")
+
+ext_surv$Predicted_Class_max <- factor(
+  ifelse(ext_surv$Predicted_Prob > cutpoint, "Pos", "Neg"),
+  levels = c("Neg", "Pos")
+)
+
+split_tab <- table(ext_surv$Predicted_Class_max)
+message ("\nMaxstat cutpoint split:\n"); print(split_tab)
+
+
+if (length(split_tab) < 2 || any(split_tab == 0)) {
+  stop("Maxstat produced a single-group split — no valid dichotomisation.")
+}
+
+group_var  <- "Predicted_Class_max"
+km_formula <- as.formula(paste("Surv(OS_time, OS_event) ~", group_var))
+```
+
+```{r}
+cox_fit_rad <- coxph(km_formula, data = ext_surv)
+cox_sum_rad <- summary(cox_fit_rad)
+
+print(cox_sum_rad)
+
+
+message("Modality   :", modality_label, "\n")
+message("Model      :", chosen_fs, "x", chosen_mod, "\n")
+message("Cutpoint   :", signif(cutpoint, 4), "\n")
+message("Group sizes:", paste(names(split_tab), split_tab, collapse = " / "), "\n")
+message("HR         :", round(cox_sum_rad$conf.int[1], 2),
+    "(95% CI", round(cox_sum_rad$conf.int[3], 2), "-",
+    round(cox_sum_rad$conf.int[4], 2), ")\n")
+message("Corrected p:", signif(maxstat_res$p.value, 3), "\n")
+```
+
+```{r}
+
+# the formula held in the km_formula variable
+fit_radiomics <- surv_fit(km_formula, data = ext_surv)
+
+hr_label <- paste0(
+  "HR = ", round(cox_sum_rad$conf.int[1], 2),
+  " (95% CI: ", round(cox_sum_rad$conf.int[3], 2),
+  "-", round(cox_sum_rad$conf.int[4], 2), ")"
+)
+
+
+p_label <- ifelse(
+  maxstat_res$p.value < 0.001,
+  "p < 0.001 (corrected)",
+  paste0("p = ", signif(maxstat_res$p.value, 2))
+)
+
+plot_title <- paste0(
+  "Overall Survival - ", chosen_fs, " x ", chosen_mod, " - ", modality_label
+)
+
+rad_plot <- ggsurvplot(
+  fit_radiomics,
+  data          = ext_surv,
+  pval          = FALSE,
+  conf.int      = TRUE,
+  palette       = c("#F8766D", "#00BFC4"),
+  xlab          = "Overall survival (days)",
+  ylab          = "Survival probability",
+  title         = plot_title,
+
+  font.title    = c(18, "bold", "black"),
+  font.x        = c(16, "bold", "black"),
+  font.y        = c(16, "bold", "black"),
+  font.tickslab = c(14, "bold", "black"),
+  font.legend   = c(12, "bold", "black"),
+
+  legend.title  = "Predicted group",
+  legend.labs   = c("Predicted NR", "Predicted R"),
+
+  risk.table          = TRUE,
+  risk.table.y.text   = FALSE,
+  risk.table.ylab     = "",
+  risk.table.height   = 0.30,
+  risk.table.fontsize = 5.5
+)
+
+rad_plot$plot <- rad_plot$plot +
+  annotate("text", x = 0, y = 0.25, label = p_label,  size = 6, fontface = "bold", hjust = 0) +
+  annotate("text", x = 0, y = 0.13, label = hr_label, size = 6, fontface = "bold", hjust = 0)
+
+# axis.text.y excluded to avoid a merging conflict with risk.table.y.text = FALSE
+rad_plot$table <- rad_plot$table +
+  theme(
+    axis.title.x = element_text(size = 16, face = "bold", color = "black"),
+    axis.text.x  = element_text(size = 14, face = "bold", color = "black"),
+    plot.title   = element_text(size = 16, face = "bold", color = "black")
+  )
+
+print(rad_plot)
+
+ggsave("KM_Delta_Absolute.png", plot = print(rad_plot),
+       width = 10, height = 8, dpi = 300)
+```
+
+```{r}
+
+# load internal trained models
+models_list        <- readRDS("all_trained_models.rds")
+r_train_mean       <- readRDS("r_train_mean.rds")
+r_train_std        <- readRDS("r_train_std.rds")
+uni_LR_variables   <- readRDS("uni_LR_variables.rds")
+prin_comp          <- readRDS("prin_comp.rds")
+features_select    <- readRDS("features_select.rds")
+reproducible_feats <- readRDS("reproducible_feats.rds")
+
+fs_names <- c("p.vars","s.vars","k.vars","mim.vars","Lasso.vars",
+              "E.Net.vars","bor.vars","rfe.vars","pca")
+
+
+# Load clinical data
+crf <- read.csv("CRF-LCIO-UPDATES.csv")
+
+# Extract Patient_Num
+crf$Patient_Num <- as.numeric(gsub("\\D", "", crf$Study.ID))
+
+# Create binary PD-L1 column (1 = Pos, 0 = Neg)
+crf$PDL1_Binary <- ifelse(crf$PD.L1 %in% c("Strongly Positive", "Weakly Positive", "1"), 1,
+                   ifelse(crf$PD.L1 == "0", 0, NA))
+
+#  drop missing tests
+pdl1_data <- crf[!is.na(crf$PDL1_Binary), c("Patient_Num", "PDL1_Binary")]
+
+
+ext <- read.csv("FINAL_DELTA_ABS_CONCATENATED.csv")
+names(ext) <- trimws(names(ext))
+names(ext) <- gsub("_(abs)_", "_", names(ext))
+
+
+names(ext) <- gsub("_base_", "_", names(ext))
+
+
+# Merge the clean PD-L1 status into the external cohort
+ext <- merge(ext, pdl1_data, by = "Patient_Num")
+message(glue("Total patients with both radiomics and PD-L1 data: {nrow(ext)}"))
+
+overlap <- intersect(reproducible_feats, names(ext))
+message(glue("Feature overlap: {length(overlap)} of {length(reproducible_feats)} reproducible_feats found in ext"))
+
+# Defensive guard so you get a clear error instead of the "undefined columns" crash
+if (length(overlap) == 0) stop("No overlapping features found — check naming convention again.")
+
+ext <- ext[, c("Patient_Num", "PDL1_Binary", overlap)]
+
+# Convert to standard Neg/Pos 
+ext_PDL1 <- factor(ext$PDL1_Binary, levels = c(0, 1), labels = c("Neg", "Pos"))
+
+# scale
+stopifnot(identical(names(ext)[-(1:2)], names(r_train_mean)))
+
+# Scale features using trained models
+ext_scaled <- as.data.frame(scale(ext[, 3:ncol(ext)],
+                                   center = r_train_mean, scale = r_train_std))
+names(ext_scaled) <- make.names(names(ext_scaled))
+ext_uniLR <- as.data.frame(ext_scaled[, uni_LR_variables, drop = FALSE])
+
+
+auc_matrix_pdl1 <- matrix(NA, nrow = length(fs_names), ncol = 10,
+                      dimnames = list(fs_names,
+                                      c("GLM","KNN","SVM","NaiveBayes","RandomForest",
+                                        "NNET","PLS","Ridge","Lasso","ElasticNet")))
+
+for (fs in fs_names) {
+
+  if (fs == "pca") {
+    ext_input <- as.data.frame(predict(prin_comp, newdata = ext_scaled))[, 1:8]
+  } else {
+    vars <- intersect(features_select[[which(fs_names == fs)]], names(ext_uniLR))
+    ext_input <- ext_uniLR[, vars, drop = FALSE]
+  }
+
+  mods <- models_list[[fs]]
+
+  for (mod_name in names(mods)) {
+    mdl <- mods[[mod_name]]
+    if (is.null(mdl)) next 
+
+    prob <- tryCatch(
+      predict(mdl, newdata = ext_input, type = "prob")[, "Pos"],
+      error = function(e) NA
+    )
+    if (all(is.na(prob))) next
+
+    # Grade the model against PDL1 
+    roc_obj <- tryCatch(
+      pROC::roc(response = ext_PDL1, predictor = prob,
+                levels = c("Neg","Pos"), direction = "<", quiet = TRUE),
+      error = function(e) NULL
+    )
+    if (!is.null(roc_obj)) {
+      auc_matrix_pdl1[fs, mod_name] <- as.numeric(pROC::auc(roc_obj))
+    }
+  }
+}
+
+# Save results
+write.csv(auc_matrix_pdl1, "external_AUC_all_combos_PDL1.csv")
+
+
+auc_df_pdl1 <- melt(auc_matrix_pdl1, varnames = c("FeatureSet", "Model"), value.name = "AUC")
+
+ggplot(auc_df_pdl1, aes(x = FeatureSet, y = Model, fill = AUC)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(AUC, 2)), size = 3) +
+  scale_fill_gradient2(low = "firebrick", mid = "white", high = "steelblue",
+                       midpoint = 0.5, limits = c(0, 1), na.value = "grey90") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "RPV-PD-L1 Status- Absolute",
+       x = "Feature Selection Method", y = "ML Model")
+```
+
+```{r}
+
+# load trained models
+models_list        <- readRDS("all_trained_models.rds")
+r_train_mean       <- readRDS("r_train_mean.rds")
+r_train_std        <- readRDS("r_train_std.rds")
+uni_LR_variables   <- readRDS("uni_LR_variables.rds")
+prin_comp          <- readRDS("prin_comp.rds")
+features_select    <- readRDS("features_select.rds")
+reproducible_feats <- readRDS("reproducible_feats.rds")
+ 
+fs_names <- c("p.vars","s.vars","k.vars","mim.vars","Lasso.vars",
+              "E.Net.vars","bor.vars","rfe.vars","pca")
+ 
+
+# Load clinical data
+crf <- read.csv("CRF-LCIO-UPDATES.csv")
+ 
+# Extract Patient_Num
+crf$Patient_Num <- as.numeric(gsub("\\D", "", crf$Study.ID))
+ 
+# Create binary Pneumonitis column (1 = Y, 0 = N)
+
+crf$Pneumonitis_Binary <- ifelse(crf$pneumonitis == "Y", 1,
+                          ifelse(crf$pneumonitis == "N", 0, NA))
+ 
+#  drop missing cases
+pneumonitis_data <- crf[!is.na(crf$Pneumonitis_Binary), c("Patient_Num", "Pneumonitis_Binary")]
+ 
+
+ext <- read.csv("FINAL_DELTA_ABS_CONCATENATED.csv")
+names(ext) <- trimws(names(ext))
+names(ext) <- gsub("_(abs)_", "_", names(ext))
+
+# strip the "_base_" token so names match reproducible_feats
+names(ext) <- gsub("_base_", "_", names(ext))
+ 
+ 
+# Merge the clean pneumonitis status into the external cohort
+ext <- merge(ext, pneumonitis_data, by = "Patient_Num")
+message(glue("Total patients with both radiomics and pneumonitis data: {nrow(ext)}"))
+ 
+overlap <- intersect(reproducible_feats, names(ext))
+message(glue("Feature overlap: {length(overlap)} of {length(reproducible_feats)} reproducible_feats found in ext"))
+
+
+if (length(overlap) == 0) stop("No overlapping features found — check naming convention again.")
+ 
+ext <- ext[, c("Patient_Num", "Pneumonitis_Binary", overlap)]
+ 
+# Convert to standard No/Yes factor 
+
+ext_Pneumonitis <- factor(ext$Pneumonitis_Binary, levels = c(0, 1), labels = c("No", "Yes"))
+
+# scale
+stopifnot(identical(names(ext)[-(1:2)], names(r_train_mean)))
+ 
+# Scale features using trained model
+ext_scaled <- as.data.frame(scale(ext[, 3:ncol(ext)],
+                                   center = r_train_mean, scale = r_train_std))
+names(ext_scaled) <- make.names(names(ext_scaled))
+ext_uniLR <- as.data.frame(ext_scaled[, uni_LR_variables, drop = FALSE])
+ 
+
+auc_matrix_pneumonitis <- matrix(NA, nrow = length(fs_names), ncol = 10,
+                      dimnames = list(fs_names,
+                                      c("GLM","KNN","SVM","NaiveBayes","RandomForest",
+                                        "NNET","PLS","Ridge","Lasso","ElasticNet")))
+ 
+for (fs in fs_names) {
+ 
+  if (fs == "pca") {
+    ext_input <- as.data.frame(predict(prin_comp, newdata = ext_scaled))[, 1:8]
+  } else {
+    vars <- intersect(features_select[[which(fs_names == fs)]], names(ext_uniLR))
+    ext_input <- ext_uniLR[, vars, drop = FALSE]
+  }
+ 
+  mods <- models_list[[fs]]
+ 
+  for (mod_name in names(mods)) {
+    mdl <- mods[[mod_name]]
+    if (is.null(mdl)) next 
+ 
+
+    prob <- tryCatch(
+      predict(mdl, newdata = ext_input, type = "prob")[, "Pos"],
+      error = function(e) NA
+    )
+    if (all(is.na(prob))) next
+ 
+    # Grade the model against pneumonitis instead of PD-L1/Response
+    roc_obj <- tryCatch(
+      pROC::roc(response = ext_Pneumonitis, predictor = prob,
+                levels = c("No","Yes"), direction = "<", quiet = TRUE),
+      error = function(e) NULL
+    )
+    if (!is.null(roc_obj)) {
+      auc_matrix_pneumonitis[fs, mod_name] <- as.numeric(pROC::auc(roc_obj))
+    }
+  }
+}
+ 
+# Save results
+write.csv(auc_matrix_pneumonitis, "external_AUC_all_combos_Pneumonitis.csv")
+ 
+
+auc_df_pneumonitis <- melt(auc_matrix_pneumonitis, varnames = c("FeatureSet", "Model"), value.name = "AUC")
+ 
+ggplot(auc_df_pneumonitis, aes(x = FeatureSet, y = Model, fill = AUC)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(AUC, 2)), size = 3) +
+  scale_fill_gradient2(low = "firebrick", mid = "white", high = "steelblue",
+                       midpoint = 0.5, limits = c(0, 1), na.value = "grey90") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  labs(title = "RPV- Pneumonitis Occurence- Absolute",
+       x = "Feature Selection Method", y = "ML Model")
+ 
+```
+
+
+
+```{r}
+
+
+### Rank features in order of importance for NNET x k.vars, with mask origin labeled
+
+# Pull the trained model out 
+classifier_nnet_kvars <- models_list[["k.vars"]][["NNET"]]
+
+# Calculate variable importance 
+imp_nnet <- varImp(classifier_nnet_kvars, scale = FALSE)
+
+# summarize importance
+print(imp_nnet)
+
+# plot importance 
+plot(imp_nnet, top = 33, main = "Feature Importance for NNET model (k.vars) - predicting Response",
+     ylab = "Features")
+
+#  data frame 
+importance_df <- imp_nnet$importance %>%
+  tibble::rownames_to_column(var = "Feature") %>%
+  arrange(desc(Overall))
+
+# Extract mask origin from the feature name prefix
+importance_df <- importance_df %>%
+  mutate(Mask = case_when(
+    grepl("^main_", Feature) ~ "main",
+    grepl("^Ms_", Feature)   ~ "Ms",
+    grepl("^Mp_", Feature)   ~ "Mp",
+    TRUE ~ "unknown"
+  ))
+
+print(importance_df)
+
+
+
+# 5. ggplot version, colored by mask of origin
+p <- ggplot(importance_df, aes(x = reorder(Feature, Overall), y = Overall, fill = Mask)) +
+  geom_col(color = "black") +
+  coord_flip() +
+  theme_bw() +
+  scale_fill_manual(values = c("main" = "#00BFC4", "Ms" = "#F8766D", "Mp" = "#F5C518")) +
+  labs(title = "Feature Importance for NNET model (k.vars)- Delta ABS",
+       subtitle = "Colored by mask of origin",
+       x = "Features", y = "Importance", fill = "Mask")
+
+print(p)
+
+ggsave("NNETxk.vars_feature_importance-Delta.Abs.png", plot = p, width = 10, height = 8, dpi = 300)
+```
+
+```{r}
+
+
+# 1. LOAD RAW COMBINED PRE+POST EXTRACTION (this csv contains the feature values of pre and post scans)
+
+raw <- read.csv("outputpdl1.csv", check.names = TRUE)
+ 
+raw <- raw %>%
+  mutate(
+    Patient_Num = as.numeric(str_extract(ID, "(?<=patient_)\\d+")),
+    Timepoint   = str_extract(ID, "pre|post"),
+    MaskFile    = basename(Mask)
+  ) %>%
+  filter(!grepl("Mp|Ms", MaskFile))   # drop Mp/Ms rows, keep only main mask
+ 
+
+# 2. PULL OUT THE 3 TARGET FEATURES FROM GRAPH PRIOR
+
+target_features_raw <- c(
+  "square_glrlm_RunPercentage",
+  "square_gldm_LargeDependenceLowGrayLevelEmphasis",
+  "wavelet.LLL_firstorder_90Percentile"
+)
+ 
+raw_sub <- raw %>%
+  select(Patient_Num, Timepoint, all_of(target_features_raw))
+ 
+
+wide_raw <- raw_sub %>%
+  pivot_wider(
+    id_cols = Patient_Num,
+    names_from = Timepoint,
+    values_from = all_of(target_features_raw),
+    names_sep = "_"
+  )
+ 
+
+# 4. ATTACH RESPONSE GROUP 
+
+post_clean <- read.csv("Fu1_PD-L1_POST_CONCATENATED.csv")
+his_lookup <- post_clean %>% select(Patient_Num, His)
+ 
+wide_raw <- wide_raw %>%
+  left_join(his_lookup, by = "Patient_Num") %>%
+  mutate(His = ifelse(His == "R", "Responder",
+                ifelse(His == "NR", "Non-Responder", NA))) %>%
+  filter(!is.na(His))
+ 
+
+# 5. COMPUTE RAW SIGNED CHANGE (POST - PRE) PER PATIENT FOR ABSOLUTE
+#    
+
+raw_change <- wide_raw %>%
+  mutate(
+    square_gldm_LargeDependenceLowGrayLevelEmphasis_change =
+      square_gldm_LargeDependenceLowGrayLevelEmphasis_post - square_gldm_LargeDependenceLowGrayLevelEmphasis_pre,
+    square_glrlm_RunPercentage_change =
+      square_glrlm_RunPercentage_post - square_glrlm_RunPercentage_pre,
+    wavelet.LLL_firstorder_90Percentile_change =
+      wavelet.LLL_firstorder_90Percentile_post - wavelet.LLL_firstorder_90Percentile_pre
+  )
+ 
+#  COMPUTE MEAN CHANGE PER FEATURE/GROUP
+
+
+mean_change <- raw_change %>%
+  select(Patient_Num, His, ends_with("_change")) %>%
+  pivot_longer(
+    cols = ends_with("_change"),
+    names_to = "Feature",
+    values_to = "Change"
+  ) %>%
+  mutate(Feature = gsub("_change$", "", Feature)) %>%
+  group_by(Feature, His) %>%
+  summarise(
+    Mean_Change = mean(Change, na.rm = TRUE),
+    SE = sd(Change, na.rm = TRUE) / sqrt(n()),
+    n = n(),
+    .groups = "drop"
+  )
+ 
+print(mean_change)
+ 
+
+wrap_at_underscore <- function(x, width = 18) {
+  sapply(x, function(s) {
+    parts <- strsplit(s, "_")[[1]]
+    out <- character(0)
+    line <- ""
+    for (p in parts) {
+      candidate <- if (line == "") p else paste0(line, "_", p)
+      if (nchar(candidate) > width && line != "") {
+        out <- c(out, line)
+        line <- p
+      } else {
+        line <- candidate
+      }
+    }
+    out <- c(out, line)
+    paste(out, collapse = "\n")
+  })
+}
+ 
+mean_change <- mean_change %>%
+  mutate(Feature_label = wrap_at_underscore(Feature, width = 18))
+ 
+
+# 8. PLOT MEAN SIGNED CHANGE 
+p_change <- ggplot(mean_change, aes(x = His, y = Mean_Change, fill = His)) +
+  geom_col(color = "black", width = 0.6) +
+  geom_errorbar(aes(ymin = Mean_Change - SE, ymax = Mean_Change + SE), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", linewidth = 0.4, color = "grey40") +
+  facet_wrap(~ Feature_label, scales = "free_y") +
+  theme_bw(base_size = 11) +
+  scale_fill_manual(values = c("Responder" = "#00BFC4", "Non-Responder" = "#F8766D")) +
+  labs(title = "Mean Change (Post vs Pre)",
+       subtitle = "Top NNET (k.vars) Features",
+       x = "Response Group", y = "Mean Change (raw feature units)", fill = "Response Group") +
+  theme(
+    legend.position = "top",
+    legend.title = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_rect(color = "black", fill = NA),
+    axis.text.x = element_text(angle = 20, hjust = 1, size = 8),
+  
+    strip.text = element_text(size = 6, face = "bold", lineheight = 0.8, margin = ggplot2::margin(t = 6, b = 6)),
+    
+    strip.background = element_rect(fill = "white", color = "black")
+  )
+ 
+print(p_change)
+ 
+
+ggsave("mean_signedChange_kvars_nnet_raw.png", plot = p_change, width = 14, height = 5.5, dpi = 300)
+```
+
+
+```{r}
+
+# 1. RETRIEVE chosen MODEL & DATA 
+
+chosen_fs  <- "k.vars"
+chosen_mod <- "NNET"
+
+# Retrieve chosen model from the models list
+chosen_model <- models_list[[chosen_fs]][[chosen_mod]]
+
+
+ext_input_chosen <- as.data.frame(ext_input_chosen)
+
+
+pfun <- function(object, newdata) {
+  
+  predict(object, newdata = newdata, type = "prob")[, "Pos"]
+}
+
+
+# CALCULATE SHAP VALUES
+
+
+set.seed(500)
+message("Calculating SHAP values for the external cohort.")
+
+shap_values <- fastshap::explain(
+  chosen_model, 
+  X = ext_input_chosen, 
+  pred_wrapper = pfun, 
+  nsim = 100, 
+  adjust = TRUE
+)
+
+
+# get shap values
+
+sv <- shapviz(shap_values, X = ext_input_chosen)
+
+# Generate the global SHAP plot
+shap_plot <- sv_importance(sv, kind = "bee") + 
+  theme_bw(base_size = 14) + 
+  labs(
+    title = paste("SHAP Summary Plot:", chosen_fs, "x", chosen_mod),
+    subtitle = "External Validation Cohort — Delta Absolute",
+    x = "SHAP Value (Impact on Prediction)"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold", color = "black"),
+    axis.text.y = element_text(size = 9, face = "bold", color = "black"),
+    axis.title.x = element_text(face = "bold", color = "black"),
+    legend.title = element_text(face = "bold")
+  )
+
+print(shap_plot)
+
+
+ggsave("SHAP_Summary_NNET_kvars_DeltaAbsolute.png", plot = shap_plot, width = 11, height = 8, dpi = 300)
+```
+
+
+
+```{r}
+# show network and hyperparameters for k.vars x NNET, delta absolute model used
+mod <- models_list[["k.vars"]][["NNET"]]
+nn <- mod$finalModel
+
+# Print architecture 
+message(glue("Network structure: {paste(nn$n, collapse = ' -> ')}"))
+message(glue("Size: {mod$bestTune$size} | Decay: {mod$bestTune$decay}"))
+
+message("\nFeatures used:")
+print(nn$coefnames)
+message("") 
+
+# Extract the weights into a dataframe
+weights_df <- data.frame(
+  Connection = names(coef(nn)),
+  Weight     = as.numeric(coef(nn))
+)
+
+print(weights_df)
+
+# Save to CSV 
+write.csv(weights_df, "NNET_kvars_DeltaAbsolute_Weights.csv", row.names = FALSE)
+```
+```{r}
+# =========================================================
+# 95% CI for every AUC (DeLong)
+# =========================================================
+ci_rows <- list()
+
+for (fs in fs_names) {
+  if (fs == "pca") {
+    ext_input <- as.data.frame(predict(prin_comp, newdata = ext_scaled))[, 1:8]
+  } else {
+    vars <- intersect(features_select[[which(fs_names == fs)]], names(ext_uniLR))
+    ext_input <- ext_uniLR[, vars, drop = FALSE]
+  }
+
+  for (mod_name in names(models_list[[fs]])) {
+    mdl <- models_list[[fs]][[mod_name]]
+    if (is.null(mdl)) next
+
+    prob <- tryCatch(predict(mdl, newdata = ext_input, type = "prob")[, "Pos"],
+                     error = function(e) NA)
+    if (all(is.na(prob))) next
+
+    r <- tryCatch(pROC::roc(ext_His, prob, levels = c("Neg","Pos"),
+                            direction = "<", quiet = TRUE),
+                  error = function(e) NULL)
+    if (is.null(r)) next
+
+    ci <- as.numeric(pROC::ci.auc(r))
+    ci_rows[[length(ci_rows) + 1]] <- data.frame(
+      FeatureSet = fs, Model = mod_name,
+      AUC = round(ci[2], 3), Lower = round(ci[1], 3), Upper = round(ci[3], 3)
+    )
+  }
+}
+
+ci_table <- do.call(rbind, ci_rows)
+ci_table <- ci_table[order(-ci_table$AUC), ]
+
+# top result, formatted for the thesis
+cat(sprintf("\nBest: %s x %s — AUC %.2f (95%% CI %.2f-%.2f)\n\n",
+            ci_table$FeatureSet[1], ci_table$Model[1],
+            ci_table$AUC[1], ci_table$Lower[1], ci_table$Upper[1]))
+
+print(head(ci_table, 10))
+write.csv(ci_table, "AUC_with_CI.csv", row.names = FALSE)
+```
